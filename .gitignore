@@ -1,0 +1,6 @@
+GRTAGS
+GPATH
+GTAGS
+build*
+*~
+\#*
