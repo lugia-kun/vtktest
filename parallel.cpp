@@ -7,11 +7,15 @@
 #include "vtkFloatArray.h"
 #include "vtkCellData.h"
 #include "vtkRectilinearGrid.h"
-#include "vtkXMLPMultiBlockDataWriter.h"
 #include "vtkProcessGroup.h"
-#include "vtkMultiBlockDataSet.h"
 #include "vtkMPIController.h"
 #include "vtkMPICommunicator.h"
+#include "vtkPassThrough.h"
+#include "vtkProgrammableFilter.h"
+#include "vtkExtentTranslator.h"
+#include "vtkStreamingDemandDrivenPipeline.h"
+#include "vtkXMLPRectilinearGridWriter.h"
+#include "vtkInformation.h"
 
 const static double x[5] = {
   0.0, 0.5, 1.0, 1.5, 2.0
@@ -32,21 +36,46 @@ const static double d[2*3*4] = {
   21.0, 22.0, 23.0,
 };
 
+struct pfData {
+  int *glob_ext;
+  int *piece_ext;
+  vtkFloatArray *dArray;
+  vtkProgrammableFilter *pf;
+};
+
+void PfExecute(void *arg)
+{
+  pfData *data;
+  vtkProgrammableFilter *pf;
+
+  data = reinterpret_cast<pfData *>(arg);
+  pf = data->pf;
+
+  vtkDataObject *input = pf->GetInput();
+  vtkDataObject *output = pf->GetOutput();
+
+  output->ShallowCopy(input);
+  output->Crop(data->piece_ext);
+
+  vtkRectilinearGrid *rg;
+  rg = vtkRectilinearGrid::SafeDownCast(output);
+  rg->GetCellData()->AddArray(data->dArray);
+}
+
 void ParMain(vtkMultiProcessController *controller, void *arg)
 {
   vtkFloatArray *xCoords = vtkFloatArray::New();
   vtkFloatArray *yCoords = vtkFloatArray::New();
   vtkFloatArray *zCoords = vtkFloatArray::New();
   vtkFloatArray *dArray = vtkFloatArray::New();
-  vtkMultiBlockDataSet *mSet = vtkMultiBlockDataSet::New();
   vtkRectilinearGrid *rGrid = vtkRectilinearGrid::New();
-  vtkSmartPointer<vtkXMLPMultiBlockDataWriter> writer =
-    vtkSmartPointer<vtkXMLPMultiBlockDataWriter>::New();
+  vtkSmartPointer<vtkXMLPRectilinearGridWriter> writer =
+    vtkSmartPointer<vtkXMLPRectilinearGridWriter>::New();
 
   int rank = controller->GetLocalProcessId();
   int nprc = controller->GetNumberOfProcesses();
 
-  for (int i = 0; i < 3; ++i) xCoords->InsertNextValue(x[i + rank * 2]);
+  for (int i = 0; i < 5; ++i) xCoords->InsertNextValue(x[i]);
   for (int i = 0; i < 4; ++i) yCoords->InsertNextValue(y[i]);
   for (int i = 0; i < 5; ++i) zCoords->InsertNextValue(z[i]);
   for (int i = 0; i < 24; ++i) dArray->InsertNextValue(d[i] + rank * 24);
@@ -56,24 +85,60 @@ void ParMain(vtkMultiProcessController *controller, void *arg)
   zCoords->SetName("z coords");
   dArray->SetName("t");
 
-  // rGrid->SetDimensions(3, 4, 5);
-  rGrid->SetExtent(2 * rank, (2 * (rank + 1)), 0, 3, 0, 4);
+  rGrid->SetDimensions(5, 4, 5);
+  //rGrid->SetExtent(2 * rank, 2 * (rank + 1), 0, 3, 0, 4);
   rGrid->SetXCoordinates(xCoords);
   rGrid->SetYCoordinates(yCoords);
   rGrid->SetZCoordinates(zCoords);
-  rGrid->GetCellData()->AddArray(dArray);
 
-  mSet->SetNumberOfBlocks(nprc);
-  mSet->SetBlock(rank, rGrid);
+  int piece_ext[6], glob_ext[6];
+  glob_ext[0] = 0;
+  glob_ext[1] = nprc * 2;
+  glob_ext[2] = 0;
+  glob_ext[3] = 3;
+  glob_ext[4] = 0;
+  glob_ext[5] = 4;
+  piece_ext[0] = 2 * rank;
+  piece_ext[1] = 2 * (rank + 1);
+  piece_ext[2] = 0;
+  piece_ext[3] = 3;
+  piece_ext[4] = 0;
+  piece_ext[5] = 4;
 
+  //rGrid->Crop(piece_ext);
+  //rGrid->GetCellData()->AddArray(dArray);
+
+  vtkProgrammableFilter *pf = vtkProgrammableFilter::New();
+  pfData data;
+
+  data.pf = pf;
+  data.glob_ext = glob_ext;
+  data.piece_ext = piece_ext;
+  data.dArray = dArray;
+
+  pf->SetInputData(rGrid);
+  pf->SetExecuteMethod(PfExecute, &data);
+
+  pf->Update();
+  pf->GetOutputInformation(0)->Print(std::cout);
+  rGrid->Print(std::cout);
+
+  writer->SetDebug(true);
   writer->SetController(controller);
-  writer->SetFileName("test.vtm");
-  writer->SetInputDataObject(mSet);
+  writer->SetFileName("test.pvtr");
+  writer->SetNumberOfPieces(nprc);
+  writer->SetStartPiece(rank);
+  writer->SetEndPiece(rank);
+  writer->SetInputConnection(pf->GetOutputPort());
+  //writer->SetInputData(rGrid);
   writer->SetCompressorTypeToNone();
+  //writer->SetDataModeToAscii();
   writer->SetDataModeToAppended();
   writer->EncodeAppendedDataOff();
+  writer->SetUseSubdirectory(true);
   writer->Write();
 
+  pf->Delete();
   rGrid->Delete();
   xCoords->Delete();
   yCoords->Delete();
